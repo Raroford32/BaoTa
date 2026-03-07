@@ -52,12 +52,11 @@ app.config['SESSION_COOKIE_NAME'] = public.md5(app.secret_key)
 
 **Important nuance:** BaoTa uses **server-side filesystem sessions** (`SESSION_TYPE = 'filesystem'`, `SESSION_USE_SIGNER = True`). The cookie contains only a signed session ID, not session data. Knowing `secret_key` lets you:
 - Sign arbitrary session IDs → the server trusts the ID as authentic
-- Predict existing session IDs via ARCH-3 (PRNG recovery) → hijack admin sessions
 - Write malicious session files via zip slip (Chain 1) or webhook (Chain 7), then reference them with a signed cookie
 
-**You cannot directly inject `session['login'] = True` into the cookie itself** — the data lives on disk. But combined with ARCH-3 (predict admin's session ID) or a file-write primitive (plant session file), the secret key recovery gives complete session control.
+**You cannot directly inject `session['login'] = True` into the cookie itself** — the data lives on disk. But combined with a file-write primitive (plant session file via zip slip or webhook), the secret key recovery gives complete session control. Session IDs use `secrets.token_urlsafe(32)` and are NOT predictable.
 
-**Impact:** Sign any session ID + predict/plant session data → authenticated access → root shell (ARCH-4).
+**Impact:** Sign any session ID + plant session data via file-write primitive → authenticated access → root shell (ARCH-4).
 
 ---
 
@@ -112,7 +111,7 @@ After a successful login with 2FA, the IP is stored for 24-hour 2FA exemption. I
 
 **Honest assessment:** The default deployment (direct port 8888 access) is NOT vulnerable to IP header spoofing. The vulnerability applies to port-free/proxy deployments and same-machine access. This is a real but conditional issue, not a universal architectural failure.
 
-**Consequence in affected deployments:** IP whitelisting, rate limiting, and 2FA — the primary defenses against brute force — are all simultaneously defeated. Combined with ARCH-3, an attacker has unlimited attempts to guess credentials with zero detection.
+**Consequence in affected deployments:** IP whitelisting, rate limiting, and 2FA — the primary defenses against brute force — are all simultaneously defeated. An attacker has unlimited attempts to guess credentials with zero detection.
 
 ---
 
@@ -331,18 +330,18 @@ This audit identifies **17 distinct attack chains** and **5 mega-chain scenarios
    | (Chain 8)   |
    +-------------+
 
-   +----------------+         +-----------------+
-   | Mersenne       |-------->| Session ID      |----> Session Hijacking
-   | Twister State  |         | Prediction      |
-   | Recovery       |         | (Chain 11)      |
-   | (Chain 11)     |         +-----------------+
-   +----------------+                |
-          |                          v
-          |                  +-------+--------+
-          |                  | Salt Prediction |----> Offline Password Crack
-          |                  | (Chain 13)      |
-          |                  +----------------+
-          |
+   ~~+----------------+         +-----------------+~~
+   ~~| Mersenne       |-------->| Session ID      |----> Session Hijacking~~
+   ~~| Twister State  |         | Prediction      |~~
+   ~~| Recovery       |         | (Chain 11)      | — INVALIDATED (Random() per call)~~
+   ~~| (Chain 11)     |         +-----------------+~~
+   ~~+----------------+~~
+
+   +----------------+
+   | Salt Prediction |----> Offline Password Crack (Chain 13 — salt prediction
+   | NOT feasible   |      aspect invalidated; MD5 weakness still exploitable)
+   +----------------+
+
    +------+------+         +------------------+
    | Timing       |-------->| API Token        |----> g.api_request=True
    | Side-Channel |         | Byte-by-Byte     |      → CSRF Bypass → RCE
@@ -1150,7 +1149,7 @@ def password_salt(password, username=None, uid=None):
 1. **MD5 is broken** — GPU hashrate: ~8 billion MD5/sec on modern hardware
 2. **Double MD5 adds negligible cost** — still one lookup per candidate
 3. **Static suffix `_bt.cn`** — reduces entropy before salting
-4. **12-char salt from weak PRNG** — predictable if Mersenne Twister state is known (Chain 11)
+4. **12-char salt from `random.Random()`** — uses non-cryptographic PRNG, but per-call instantiation prevents cross-call prediction (Chain 11 invalidated)
 5. **Salt stored alongside hash** — standard for salted hashing, but with MD5 speed it's trivially cracked
 
 ### Attack: With database access
@@ -1421,7 +1420,6 @@ PHASE 1: RECONNAISSANCE (1 HTTP request)
      → Observe Set-Cookie header: cookie name = md5(secret_key)
      → Response also returns a valid signed session cookie
      → Side effect: /public is now accessible for 6 minutes (Chain 14)
-     → Side effect: last_login_token in HTML = 32-char PRNG output (Chain 11)
      → If lucky: HTTP 302 redirect leaks admin path (Chain 15)
 
 PHASE 2: VERSION FINGERPRINTING (conditional)
@@ -1458,8 +1456,8 @@ PHASE 5: AUTHENTICATED ACCESS → RCE
   16. Or: create cron task with shell injection (Chain 7)
   17. Commands execute as root via subprocess.Popen(shell=True)
 
-COMPLEXITY: Medium — ~700 requests for PRNG recovery, or /hook for file write
-TOTAL: ~700 HTTP GETs + offline computation → root shell
+COMPLEXITY: Medium — requires /hook for file write (webhook plugin must be installed)
+TOTAL: 1 HTTP GET (recon) + offline brute-force + /hook file write → root shell
 ```
 
 **Why the PRNG path is blocked:**
@@ -1495,20 +1493,19 @@ PHASE 2: SECRET KEY RECOVERY
        compare to observed cookie name
   6. Match found → secret_key recovered
 
-PHASE 3: SESSION FORGERY
-  7. Forge Flask session cookie signed with recovered secret_key
-  8. Access authenticated panel routes
+PHASE 3: FILE-WRITE PRIMITIVE (requires webhook plugin OR authenticated zip extract)
+  7. If webhook plugin installed: use unauthenticated /hook (Chain 7) to write
+     pickle session file to data/session/md5("BT_:" + chosen_session_id)
+  8. If no webhook: must obtain authenticated session first (brute-force login
+     with ARCH-2 in proxy deployments), then use zip slip (Chain 1)
 
-PHASE 4: PLANT PICKLE PAYLOAD
-  9. Create malicious zip with pickle session file (Chain 1)
-  10. Upload and extract via /files?action=UnZip
-
-PHASE 5: DETONATE
-  11. Any subsequent session load triggers pickle.loads() → RCE as root
-  12. OR: Force trigger by accessing any authenticated route with forged session
+PHASE 4: SESSION FORGERY + DETONATE
+  9. Sign chosen session_id with recovered secret_key → forge cookie
+  10. Request with forged cookie → server loads planted pickle file
+  11. pickle.loads() → RCE as root
 ```
 
-**Total prerequisites:** Network access only. No credentials, no user interaction.
+**Total prerequisites:** Network access + webhook plugin installed (for /hook file write). Without webhook plugin, requires authenticated access for zip slip, reducing this to an escalation chain rather than fully unauthenticated RCE.
 
 ### Mega-B: Cross-Site Zero-Click RCE from External Website
 
@@ -1658,7 +1655,7 @@ PHASE 4: INJECT
 | `BTPanel/__init__.py` | 3236 | 5 | shell=True in sock_shell |
 | `BTPanel/__init__.py` | 3289-3290 | 5, 9 | g.api_request + debug CSRF bypass |
 | `BTPanel/__init__.py` | ~2790 | 6 | get_input() param merge/pollution |
-| `class/public.py` | 237-251 | 11 | Mersenne Twister PRNG in GetRandomString() |
+| `class/public.py` | 237-251 | 11 (INVALIDATED) | Mersenne Twister PRNG — per-call Random() prevents cross-call prediction |
 | `class/public.py` | 3702-3706 | 13 | Weak PRNG salt + double MD5 password hashing |
 | `class/public.py` | 3719-3734 | 13 | password_salt() uses md5(md5()+salt) |
 | `class/common.py` | 333 | 12 | Timing-unsafe `==` comparison on tokens |

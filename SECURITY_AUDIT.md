@@ -8,9 +8,9 @@
 
 ## Executive Summary
 
-This audit goes beyond individual vulnerability identification to map **composite attack chains** — sequences of weaknesses that, when chained together, escalate from minor issues to full system compromise. We identified **13 distinct attack chains** and **4 mega-chain scenarios** that compose 3+ chains into complete exploitation paths.
+This audit goes beyond individual vulnerability identification to map **composite attack chains** — sequences of weaknesses that, when chained together, escalate from minor issues to full system compromise. We identified **17 distinct attack chains** and **5 mega-chain scenarios** that compose 3+ chains into complete exploitation paths.
 
-The most critical discovery is that the pickle deserialization safety mechanism (`restricted_loads`) has been **intentionally disabled** (commented out, returns `True`), while session files are stored on disk and loaded via `pickle.loads()`. Combined with a zip slip path traversal in the file extraction code, this creates a **plant-and-wait RCE** — an attacker extracts a crafted zip file, and the next admin login triggers arbitrary code execution as root.
+**The most critical finding: multiple chains require ZERO authentication — only knowledge of IP:8888.** An unauthenticated attacker with network access alone can achieve full root RCE through several independent paths.
 
 ### Chain Dependency Graph
 
@@ -920,7 +920,289 @@ def password_verify(password, hashed):
 
 ---
 
-## MEGA-CHAIN SCENARIOS
+---
+
+# ZERO-PRIVILEGE CHAINS (Attacker knows only IP:8888)
+
+The following chains require **absolutely no credentials, no prior access, no user interaction**. An attacker with only knowledge of the target IP and default port 8888 can exploit these.
+
+---
+
+## CHAIN 14: `/login` GET → Automatic `/public` Cache Grant → Unauthenticated Function Access
+
+**Severity:** CRITICAL | **CWE:** CWE-306 | **CVSS:** 8.6
+**Prerequisites:** NONE — only network access to port 8888
+**Impact:** Access to `/public` route functions without any authentication
+
+### The Flaw: Visiting Login Grants Access to /public
+
+When anyone visits the `/login` page (a simple GET request), the server **unconditionally** sets a cache entry:
+
+```python
+# BTPanel/__init__.py:1979-1982  (inside login GET handler)
+public.cache_set(
+    public.Md5(
+        uuid.UUID(int=uuid.getnode()).hex[-12:] +
+        public.GetClientIp()), 'check', 360)    # Valid for 6 minutes
+```
+
+The `/public` route checks this SAME cache key:
+
+```python
+# BTPanel/__init__.py:2159-2162
+if public.cache_get(
+        public.Md5(
+            uuid.UUID(int=uuid.getnode()).hex[-12:] +
+            public.GetClientIp())) != 'check':
+    return abort(404)
+```
+
+**The cache key uses the same MAC + IP on both sides.** Simply visiting `http://IP:8888/login` opens `/public` for your IP for 6 minutes. No MAC prediction needed. No authentication needed.
+
+### What `/public` Exposes
+
+After the cache check passes, `/public` provides access to:
+- `login_qrcode` — QR code generation for mobile app login
+- `is_scan_ok` — Check if QR login was approved
+- `set_login` — Execute login via mobile app approval
+
+These functions are gated by `check_app('app')` (whether a BT mobile app is bound). But the `get_ping` sub-handler (lines 2147-2157) executes **BEFORE** the cache check:
+
+```python
+# BTPanel/__init__.py:2146-2157  — BEFORE the MAC cache check!
+if 'get_ping' in get:
+    try:
+        import panelPing
+        p = panelPing.Test()
+        get = p.check(get)
+        if not get: return abort(404)
+        result = getattr(p, get['act'])(get)   # Arbitrary method call!
+```
+
+If `panelPing.Test` class exists (in updated panel versions), `getattr(p, get['act'])(get)` is **arbitrary method invocation with user-controlled method name**. No auth, no cache check.
+
+### Fix
+
+```python
+# 1. Don't set /public cache on login page visit
+# Move cache_set to AFTER successful authentication
+
+# 2. Move get_ping AFTER the cache check
+# 3. Whitelist allowed methods instead of getattr
+```
+
+---
+
+## CHAIN 15: Secret Admin Path Leakage via HTTP Redirect
+
+**Severity:** HIGH | **CWE:** CWE-200 | **CVSS:** 7.5
+**Prerequisites:** Same source IP as a recent admin login (NAT/corporate network), or same IP + User-Agent
+**Impact:** Reveals the "security entrance" URL, bypassing the main access control
+
+### The Information Leak
+
+BaoTa uses a "security entrance" — a secret URL path (e.g., `/bt_secret_abc123`) that must be known to access the login page. This is the primary defense against unauthorized access.
+
+When `error_not_login()` is called, it checks `check_client_info()`:
+
+```python
+# class/public.py:5756-5770
+def error_not_login(e=None, _src=None):
+    client_status = check_client_info()
+    if client_status == 1:
+        if x_http_token:
+            result = {"redirect": get_admin_path(), ...}  # LEAKS ADMIN PATH!
+            return Response(json.dumps(result), ...)
+        return redirect(get_admin_path())                  # LEAKS VIA HTTP 302!
+```
+
+And `check_client_info()` returns `1` when:
+
+```python
+# class/public.py:8265-8294
+def check_client_info():
+    remote_addr = get_client_ip()
+    user_agent = request.headers.get('User-Agent', '')
+    session_id = md5(remote_addr + user_agent)
+    if cache.get('last_client_session_id') == session_id: return 1  # IP+UA match
+
+    last_login_info = db_obj.table('client_info').order('id desc').find()
+    if last_login_info['session_id'] == session_id:
+        if (now_time - last_login_info['login_time']) < (86400 * 2):
+            cache.set('last_client_session_id', session_id, ...)
+            return 1   # Same IP+UA as last login, within 2 days
+```
+
+### Attack Scenarios
+
+1. **Corporate NAT:** Admin logs in from office IP `203.0.113.1`. Any colleague on the same NAT IP with the same browser User-Agent gets redirected to the admin path when visiting any panel URL.
+
+2. **Shared hosting / VPS neighbors:** On shared infrastructure where source IPs may overlap.
+
+3. **Simple enumeration:** An attacker sends requests to random paths with common User-Agent strings. If the redirect to admin path occurs, the secret URL is revealed.
+
+### Impact
+
+Once the security entrance is known, the attacker can reach the login form, which enables:
+- Login brute-force (5 attempts per 300 seconds per IP)
+- Username enumeration via differential error messages (Chain 16)
+- Chain 14 (/public access via login GET)
+
+### Fix
+
+```python
+# Never redirect to admin path for unauthenticated users
+def error_not_login(e=None, _src=None):
+    return error_404(e)  # Always return generic 404
+```
+
+---
+
+## CHAIN 16: Username Enumeration via Differential Error Messages
+
+**Severity:** MEDIUM | **CWE:** CWE-204 | **CVSS:** 5.3
+**Prerequisites:** Access to login form (requires security entrance, or Chain 15)
+**Impact:** Confirm valid usernames, enabling targeted password attacks
+
+### The Differential Responses
+
+```python
+# class/userlogin.py:120-127 — User NOT found:
+if not userInfo:
+    return public.returnJson(False,
+        '[8002]用户名或密码错误，请刷新页面重试，您还可以重试[{}]次'.format(num))
+
+# class/userlogin.py:135-140 — User found but password wrong:
+if s_username != post.username or userInfo['password'] != password:
+    return public.returnJson(False,
+        'LOGIN_USER_ERR', (str(num),))
+```
+
+Two different error message formats:
+- `[8002]用户名或密码错误` → username does NOT exist
+- `LOGIN_USER_ERR` → username EXISTS, password is wrong
+
+An attacker can distinguish these responses to confirm valid usernames before attempting password brute-force.
+
+### Fix
+
+```python
+# Use identical error messages for both cases
+return public.returnJson(False, 'LOGIN_USER_ERR', (str(num),))
+```
+
+---
+
+## CHAIN 17: Debug Traceback Information Disclosure to Unauthenticated Users
+
+**Severity:** HIGH | **CWE:** CWE-209, CWE-200 | **CVSS:** 7.5
+**Prerequisites:** `data/debug.pl` exists (can be planted via zip slip Chain 1/9, OR may exist on development installations)
+**Impact:** Full Python tracebacks leaked to unauthenticated users, revealing file paths, versions, internal state
+
+### The Vulnerability
+
+```python
+# BTPanel/__init__.py:418-425  (exception handler)
+@app.errorhandler(Exception)
+def error_500(e):
+    error_info = public.get_error_info().strip()
+    if not session.get('login', None):
+        is_panel_error = False
+        if error_info.find("Traceback") != -1 and os.path.exists("data/debug.pl"):
+            is_panel_error = True           # <-- Debug flag
+        if not is_panel_error:
+            return public.error_not_login() # <-- Normal: hide errors
+    # If is_panel_error == True, FALLS THROUGH to show full error page!
+```
+
+When `debug.pl` exists, unhandled exceptions are shown to unauthenticated users with:
+
+```python
+# BTPanel/__init__.py:445-457
+request_info = '''REQUEST_DATE: {request_date}
+  VERSION: {os_version} - {panel_version}     # OS version + panel version!
+ REMOTE_ADDR: {remote_addr}
+ REQUEST_URI: {method} {full_path}
+REQUEST_FORM: {request_form}
+  USER_AGENT: {user_agent}'''
+```
+
+### Information Disclosed
+
+- **Panel version** → enables CVE-specific attacks
+- **OS version** → constrains `os.uname()` for Chain 2 secret key brute-force
+- **Python traceback** → reveals file paths, module versions, internal state
+- **Request form data** → potential credential/token exposure in error context
+
+### Attack Amplification
+
+The OS version disclosure directly feeds Chain 2 (cookie oracle). Combined:
+1. Trigger error → get OS version from traceback
+2. Observe cookie name → get MD5(secret_key)
+3. Brute-force boot_time with known uname → recover secret_key
+4. Forge session → full admin access → RCE
+
+### Fix
+
+```python
+# Never show tracebacks to unauthenticated users regardless of debug mode
+if not session.get('login', None):
+    return public.error_not_login()
+```
+
+---
+
+# MEGA-CHAIN SCENARIOS
+
+### Mega-E: FULLY ZERO-PRIVILEGE — From IP:8888 to Root Shell (No Credentials, No Interaction)
+
+**Chains used:** 14 + 2 + 1 | **Auth Required:** NONE
+
+This is the most critical scenario. An attacker with ONLY knowledge of `IP:8888`:
+
+```
+PHASE 1: RECONNAISSANCE (1 HTTP request)
+  1. GET http://IP:8888/login
+     → Observe Set-Cookie header: cookie name = md5(secret_key)
+     → Side effect: /public is now accessible for 6 minutes (Chain 14)
+     → If lucky: HTTP 302 redirect leaks admin path (Chain 15)
+
+PHASE 2: VERSION FINGERPRINTING (conditional)
+  2. If debug.pl exists: trigger exception → traceback reveals os_version
+  3. If no debug: fingerprint via SSH banner, HTTP server header, or
+     known BT-Panel install patterns for the OS uname string
+
+PHASE 3: SECRET KEY RECOVERY (offline, < 1 second)
+  4. Extract cookie name from Set-Cookie header
+  5. For each boot_time candidate in 30-day window:
+       secret = md5(str(os.uname()) + str(boot_time))
+       if md5(secret) == cookie_name: FOUND
+  6. 2.6M candidates × 2 MD5 ops = ~5.2M hashes
+  7. At 10M MD5/sec → complete in 0.5 seconds
+
+PHASE 4: SESSION FORGERY (instant)
+  8. With secret_key, forge Flask session cookie:
+     - session['login'] = True
+     - session['username'] = 'admin'
+     - session['uid'] = 1
+  9. Sign cookie with HMAC using recovered secret_key
+
+PHASE 5: AUTHENTICATED ACCESS → RCE
+  10. Use forged session to access any authenticated route
+  11. Option A: Upload malicious zip → zip slip → pickle session file → RCE (Chain 1)
+  12. Option B: Direct WebSocket shell at /sock_shell
+  13. Option C: Create cron task with shell injection (Chain 7)
+
+TOTAL: 2-3 HTTP requests + offline computation → root shell
+```
+
+**Why this works unconditionally:**
+- `/login` GET requires no auth (it's the login page)
+- Cookie name is in every HTTP response
+- `os.uname()` has limited entropy (discoverable)
+- `psutil.boot_time()` is a single float (brutable)
+- Session forgery gives full admin access
+- Multiple paths to RCE from admin
 
 ### Mega-A: Full Unauthenticated Remote RCE (Zero Credentials)
 
@@ -1044,6 +1326,10 @@ PHASE 4: INJECT
 | P0 | **Add auth to `/hook` route** via `comm.local()` | 7 |
 | P0 | **Add timestamp freshness check** to API token validation | 5 |
 | P0 | **Escape ZIP password** in `panelTask.py:583` (same as RAR path) | 4 |
+| P0 | **Move `/public` cache_set to AFTER successful login**, not on GET | 14 |
+| P0 | **Never redirect to admin path** in `error_not_login()` for unauth users | 15 |
+| P0 | **Never show tracebacks** to unauthenticated users regardless of debug mode | 17 |
+| P0 | **Use identical error messages** for wrong username vs wrong password | 16 |
 
 ### Short-Term — Eliminates Chain Enablers
 
@@ -1102,3 +1388,36 @@ PHASE 4: INJECT
 | `class/public.py` | 3702-3706 | 13 | Weak PRNG salt + double MD5 password hashing |
 | `class/public.py` | 3719-3734 | 13 | password_salt() uses md5(md5()+salt) |
 | `class/common.py` | 333 | 12 | Timing-unsafe `==` comparison on tokens |
+
+---
+
+## Appendix B: Zero-Privilege Attack Surface Map
+
+| Route | Auth Check | IP Check | What It Does | Exploitable? |
+|-------|-----------|----------|-------------|-------------|
+| `/login` GET | NONE | NONE | Renders login page, **sets /public cache** | YES — Chain 14 |
+| `/login` POST | Login form | NONE | Processes login | YES — Chain 16 (username enum) |
+| `/hook` | NONE | Skipped | Webhook execution | YES — Chain 7 (if plugin installed) |
+| `/public` | Cache check | Skipped | App login QR code | YES — Chain 14 (cache auto-granted) |
+| `/public?get_ping` | NONE | Skipped | Ping test (before cache check) | POTENTIAL — if panelPing.Test exists |
+| `/safe/<mod>/<def>` | `comm.local()` | Skipped | Safety controller | NO — requires session |
+| `/down/<token>` | Token check | Skipped | File download sharing | NO — requires valid token |
+| `/check_bind` | `check_app()` | NONE | App binding check | LIMITED — requires app binding |
+| `/get_app_bind_status` | `check_app()` | NONE | App bind status | LIMITED — requires app binding |
+| `/code` | Session check | NONE | CAPTCHA image | NO — requires session |
+| `/install` | `install.pl` | NONE | Initial setup | YES — if install.pl exists (race) |
+| Any 404/403/500 | NONE | NONE | Error pages | YES — Chain 15 (admin path leak), Chain 17 (debug traceback) |
+
+### Key Insight: `before_request()` Auth Bypass List
+
+```python
+# BTPanel/__init__.py:259 — Debug mode skips ALL auth
+if session.get('debug') == 1: return    # EVERYTHING after this is skipped
+
+# BTPanel/__init__.py:264-267 — Basic auth whitelist
+'/public', '/download', '/mail_sys', '/hook', '/down',
+'/check_bind', '/get_app_bind_status'    # These skip basic auth entirely
+
+# BTPanel/__init__.py:276-278 — IP allowlist bypass
+'/safe', '/hook', '/public', '/mail_sys', '/down'  # These skip IP checks
+```

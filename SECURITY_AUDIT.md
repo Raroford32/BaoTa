@@ -1412,6 +1412,11 @@ PHASE 4: INJECT
 | `class/public.py` | 3702-3706 | 13 | Weak PRNG salt + double MD5 password hashing |
 | `class/public.py` | 3719-3734 | 13 | password_salt() uses md5(md5()+salt) |
 | `class/common.py` | 333 | 12 | Timing-unsafe `==` comparison on tokens |
+| `BTPanel/__init__.py` | 2229 | 14 | `/mail_sys` skips `comm.local()` auth check |
+| `BTPanel/__init__.py` | 1979-1982 | 14 | `/login` GET sets `/public` cache unconditionally |
+| `class/public.py` | 5756-5770 | 15 | `error_not_login()` leaks admin path via redirect |
+| `class/userlogin.py` | 120-140 | 16 | Differential error messages for username enumeration |
+| `BTPanel/__init__.py` | 418-425 | 17 | Debug tracebacks shown to unauthenticated users |
 
 ---
 
@@ -1428,6 +1433,7 @@ PHASE 4: INJECT
 | `/down/<token>` | Token check | Skipped | File download sharing | NO — requires valid token |
 | `/check_bind` | `check_app()` | NONE | App binding check | LIMITED — requires app binding |
 | `/get_app_bind_status` | `check_app()` | NONE | App bind status | LIMITED — requires app binding |
+| `/mail_sys/send_mail_http.json` | NONE | Skipped | Send email | YES — if mail plugin installed (unauthenticated email relay) |
 | `/code` | Session check | NONE | CAPTCHA image | NO — requires session |
 | `/install` | `install.pl` | NONE | Initial setup | YES — if install.pl exists (race) |
 | Any 404/403/500 | NONE | NONE | Error pages | YES — Chain 15 (admin path leak), Chain 17 (debug traceback) |

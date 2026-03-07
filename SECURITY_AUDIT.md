@@ -682,8 +682,11 @@ Beyond the primary chains, these authenticated endpoints have the same `ExecShel
 | `backup_bak.py:267` | `ExecShell(python_bin + ' ... path %s &' % get.path)` | Backup path — `%s` no quoting |
 | `backup_bak.py:490` | `ExecShell(... ' down %s %s %s %s %s &' % (url,name,type,id,name))` | Backup download — 5 unquoted params |
 | `firewall_new.py:146-155` | `ExecShell('ufw deny from ' + address + ' to any')` | Firewall IP ban — validated by regex but `DelDropAddress` at line 168 reads from DB without re-validation |
+| `files.py:3126` | `subprocess.run("cat {}* > {}".format(split_path, merged_path), shell=True)` | File merge — path from JSON file, zero escaping |
+| `ftp.py:99-101` | `ExecShell('chown www.www ' + get.path)` + `subprocess.run('echo ... pure-pw useradd "{}" -d {}'.format(username, path), shell=True)` | FTP user creation — path, username, password all injectable |
+| `database.py:3840` | `Popen("mysqldump -u {} -p{} -d {} {} > {}".format(user, pw, db, table, file), shell=True)` | MySQL export — db_name, table_name, filename all unquoted; also **leaks root MySQL password via print()** |
 
-Each of these is an independent authenticated RCE. The root cause is the same: `ExecShell()` with `shell=True` and string-formatted user input.
+Each of these is an independent authenticated RCE. The root cause is the same: `ExecShell()` or `subprocess.Popen/run` with `shell=True` and string-formatted user input.
 
 ### Authenticated Arbitrary File Read (LFI)
 
@@ -853,3 +856,9 @@ Multiple SQL operations using `%s` string formatting instead of parameterized qu
 | `class/backup_bak.py` | 267, 490 | — | Backup path/download — shell injection via `%s` |
 | `class/firewall_new.py` | 146-179 | — | Firewall IP — shell injection (mitigated by regex on add, not on delete) |
 | `class/databaseModel/sqlserverModel.py` | 138-274 | — | SQL injection via `%s` formatting in MSSQL operations |
+| `class/files.py` | 3126-3128 | — | File merge — `cat {}* > {}` with path from JSON, `shell=True` |
+| `class/ftp.py` | 99-101 | — | FTP user creation — path/username/password all in shell command |
+| `class/database.py` | 3840-3844 | — | MySQL export — 3 unquoted params in `mysqldump` + leaks root password via `print()` |
+| `class/database.py` | 3827 | — | SQL injection in `ALTER TABLE` via `db_name`, `table_name`, `comment` |
+| `class/panelMessage.py` | 235 | — | `eval('msg_main.{}_msg()'.format(module))` — eval with module name |
+| `class/send_to_user.py` | 123 | — | `eval('module_main.{}()'.format(module))` — eval with module name |

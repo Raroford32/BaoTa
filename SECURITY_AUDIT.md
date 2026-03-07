@@ -116,42 +116,42 @@ After a successful login with 2FA, the IP is stored for 24-hour 2FA exemption. I
 
 ---
 
-### ARCH-3: Insecure PRNG — Every Security Token is Predictable
+### ARCH-3: Non-Cryptographic PRNG for Security Tokens (Limited Exploitability)
 
-**Root Cause:** `class/public.py:5731-5739`
+**Root Cause:** `class/public.py:237-251`
 ```python
 def GetRandomString(length):
-    from random import choice  # Mersenne Twister — NOT cryptographically secure
-    import string
-    chars = string.ascii_letters + string.digits
-    return ''.join([choice(chars) for i in range(length)])
+    from random import Random       # Mersenne Twister — NOT cryptographically secure
+    strings = ''
+    chars = 'AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789'
+    chrlen = len(chars) - 1
+    random = Random()               # NEW INSTANCE PER CALL — seeded from os.urandom()
+    for i in range(length):
+        strings += chars[random.randint(0, chrlen)]
+    return strings
 ```
 
-**ALL security tokens use Python's `random.choice()` — Mersenne Twister PRNG, which is fully recoverable from observed output.**
+**Critical correction from earlier analysis:** `GetRandomString()` creates a **new `Random()` instance per call**, seeded from `os.urandom()` each time. This means:
 
-**Tokens generated with insecure PRNG:**
+- **Cross-call state recovery is NOT possible.** Each call starts with fresh entropy from the OS cryptographic random pool. Observing the output of one call reveals nothing about future calls.
+- The classic Mersenne Twister attack (observe 624 outputs from same instance → predict all future outputs) **does NOT apply** because the instance is discarded after each call.
+- Within a single call, the 32 characters ARE from the same Mersenne Twister state, but the instance is discarded before any additional outputs are generated.
 
-| Token | Location | Length | Leaked to unauthenticated users? |
-|-------|----------|--------|----------------------------------|
-| `request_token` | `BTPanel/__init__.py:1989` | 32 chars | YES — in `/login` GET response |
-| `request_token_head` | `BTPanel/__init__.py:1990` | 48 chars | YES — in `/login` GET response |
-| `session['token']` | `BTPanel/__init__.py:1991` | 32 chars | YES — in `/login` GET response |
-| App bind token | `class/panelApi.py:231` | 18 chars | NO (server-side) |
-| CAPTCHA code | `BTPanel/__init__.py:2127` | variable | NO (but predictable) |
+**What this means for exploitability:**
 
-**Per `/login` GET request:** 112 calls to `random.choice()`, leaking ~666 bits of PRNG state.
+| Previous Claim | Reality |
+|---------------|---------|
+| "~25 requests to `/login` recovers full PRNG state" | **WRONG** — each request creates a new `Random()` instance |
+| "Predict all future CSRF/bind/CAPTCHA tokens" | **WRONG** — outputs are independent across calls |
+| "Mersenne Twister state recovery from observed output" | **NOT APPLICABLE** — no shared state between calls |
 
-**Recovery:** Mersenne Twister has 19,937 bits of state, recoverable from 624 × 32-bit outputs. With ~666 bits per request, **~25 GET requests to `/login`** provides enough output to fully recover the PRNG state using standard tools (e.g., `randcrack`).
+**What IS still true:**
+- Using `random.Random()` instead of `secrets` is a **code quality issue** — it's not best practice for security tokens
+- The randomness quality per token is lower than `secrets.token_urlsafe()` (Mersenne Twister vs CSPRNG)
+- However, since each instance is seeded from `os.urandom()`, the practical security is adequate for most purposes
+- Session IDs correctly use `secrets.token_urlsafe(32)` (`class/flask_session/sessions.py:62-63`)
 
-**Once recovered, the attacker can predict:**
-- All future CSRF tokens → bypass CSRF protection
-- All future bind tokens → unauthorized device binding
-- All future CAPTCHA codes → bypass CAPTCHA
-- All future password salts → precompute hashes
-
-**What ARCH-3 CANNOT predict:** Session IDs. Flask-Session uses `secrets.token_urlsafe(32)` (`class/flask_session/sessions.py:62-63`), which draws from the OS cryptographic random pool, not Mersenne Twister. Session IDs have 256 bits of real entropy and are unpredictable.
-
-**This is not a theoretical attack.** Mersenne Twister state recovery from observed output is a solved problem with off-the-shelf tools. The practical value is CAPTCHA bypass (enabling automated login brute-force) and CSRF bypass (enabling cross-site attacks).
+**Honest assessment:** ARCH-3 as originally stated was **significantly overstated**. The `Random()` per-call pattern means cross-call prediction is not feasible. This finding is a code quality concern, not an exploitable vulnerability. The previous claims about CAPTCHA prediction, CSRF bypass, and brute-force enablement via PRNG recovery are **incorrect**.
 
 ---
 
@@ -222,17 +222,18 @@ Step 5: WebSocket → root shell (ARCH-4)
 ```
 **Assessment:** ARCH-1 amplifies existing access but doesn't create it from scratch.
 
-**Path B: ARCH-3 + Credential Brute-Force — Always Works, Slow**
+**Path B: Credential Brute-Force — Always Works, Slow**
 ```
-Step 1: 25 GET /login requests → recover Mersenne Twister PRNG state (ARCH-3)
-Step 2: Predict CAPTCHA codes → bypass CAPTCHA on login
-Step 3: Brute-force login (5 attempts per 300s per IP)
+Step 1: Access login form (requires knowing security entrance path, or Chain 15)
+Step 2: Brute-force login (5 attempts per 300s per IP)
         In proxy deployments + ARCH-2: unlimited attempts via X-Forwarded-For rotation
-Step 4: Successful login → root shell (ARCH-4)
+Step 3: Successful login → root shell (ARCH-4)
 
 Time: Hours to days (depends on password strength, deployment mode)
+Note: CAPTCHA codes are NOT predictable (ARCH-3 corrected — Random() per call)
+      OCR-based CAPTCHA solving may still be feasible
 ```
-**Assessment:** Always works given enough time. ARCH-2 (proxy mode) accelerates dramatically.
+**Assessment:** Always works given enough time and a weak password. ARCH-2 (proxy mode) accelerates dramatically. No PRNG bypass available.
 
 **Path C: ARCH-1 + Chain 7 (/hook) — Requires Webhook Plugin**
 ```
@@ -243,20 +244,22 @@ Step 3: Forge cookie → authenticated → root shell
 ```
 **Assessment:** Fast but depends on webhook plugin being installed.
 
-**Path D: ARCH-1 + ARCH-3 + Login Bypass — Most Reliable Unauthenticated Path**
+**Path D: Credential Brute-Force + ARCH-2 (Proxy Deployments) — Fastest Unconditional Path**
 ```
-Step 1: Recover secret_key (ARCH-1, ~0.3s)
-Step 2: Recover PRNG state (ARCH-3, ~25 requests)
-Step 3: Predict CAPTCHA + CSRF tokens → automate login attempts
-Step 4: Brute-force credentials (rate-limited to 5/300s in default deployment)
-Step 5: Login succeeds → ARCH-4 → root shell
-
-Enhancement if proxy deployment (ARCH-2):
-  Step 3.5: Rotate X-Forwarded-For → unlimited attempts → fast brute-force
+Step 1: Discover security entrance path (Chain 15, or enumeration)
+Step 2: In proxy deployments: rotate X-Forwarded-For → unlimited login attempts
+Step 3: Brute-force credentials (OCR CAPTCHA if needed)
+Step 4: Login succeeds → ARCH-4 → root shell
 ```
-**Assessment:** This is the realistic "always works" path. Speed depends on password strength and deployment mode (direct vs proxy).
+**Assessment:** This is the realistic "always works" path in proxy deployments. Speed depends on password strength. In default (direct) deployments, rate-limited to 5 attempts per 300 seconds per IP.
 
-**Honest bottom line:** There is no unconditional instant RCE from network access alone. The systemic weaknesses (ARCH-1 through ARCH-4) dramatically reduce the effort needed, but the final step always requires either valid credentials (bruteforceable), a file write primitive (chain-dependent), or an installed optional plugin. The strongest unconditional path is ARCH-3 (predict CAPTCHA) + credential brute-force + ARCH-4 (root shell on login).
+**Honest bottom line:** There is no unconditional instant RCE from network access alone. The confirmed systemic weaknesses are:
+- **ARCH-1** (secret key recovery) — trivially fast but requires a file-write primitive to exploit
+- **ARCH-2** (IP spoofing in proxy deployments) — enables unlimited brute-force where applicable
+- **ARCH-3** (non-cryptographic PRNG) — code quality issue, NOT exploitable for cross-call prediction
+- **ARCH-4** (login = root shell) — the fundamental design flaw that makes credential compromise = total compromise
+
+The strongest unconditional path is **credential brute-force** (accelerated by ARCH-2 in proxy deployments) + **ARCH-4** (instant root shell on login). The PRNG-based CAPTCHA/CSRF prediction attack originally claimed in ARCH-3 is **not feasible** due to per-call `Random()` instantiation.
 
 ---
 
@@ -1037,53 +1040,41 @@ self._last_cache = json.loads(f_data)
 
 ---
 
-## CHAIN 11: Mersenne Twister State Recovery → Session ID Prediction → Session Hijacking
+## CHAIN 11: ~~Mersenne Twister State Recovery → Session ID Prediction~~ — INVALIDATED
 
-**Severity:** HIGH | **CWE:** CWE-338 | **CVSS:** 8.1
-**Prerequisites:** Ability to observe ~624 outputs of the PRNG (via token/session generation)
-**Impact:** Predict all future session IDs, tokens, and password salts
+**Severity:** ~~HIGH~~ **LOW (code quality)** | **CWE:** CWE-338
+**Original claim:** Observe ~624 PRNG outputs → predict all future tokens
+**Status:** **INVALIDATED** after detailed code review
 
-### Step 1: Weak PRNG in All Security-Critical Randomness
+### Why This Chain Does Not Work
+
+The original analysis assumed `GetRandomString()` uses a **shared global PRNG instance**. In reality:
 
 ```python
-# class/public.py:237-251
+# class/public.py:237-251 — ACTUAL CODE
 def GetRandomString(length):
-    from random import Random          # NOT cryptographically secure
-    strings = ''
-    chars = 'AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789'
-    chrlen = len(chars) - 1
-    random = Random()                  # Mersenne Twister PRNG
+    from random import Random
+    random = Random()              # NEW INSTANCE PER CALL — seeded from os.urandom()
     for i in range(length):
         strings += chars[random.randint(0, chrlen)]
     return strings
 ```
 
-This function is used for:
-- **Session IDs** (64 chars) — session generation
-- **Login tokens** (32 chars) — `public.py:3711`
-- **Password salts** (12 chars) — `public.py:3702`
-- **WebSocket IDs** (16 chars) — WebSocket management
-- **Temporary paths** — file operations
+**Key facts:**
+1. `Random()` creates a **new Mersenne Twister instance** per call
+2. Each instance is auto-seeded from `os.urandom()` (cryptographic entropy)
+3. The instance is **discarded** after the call returns
+4. There is **no shared state** between calls
 
-### Step 2: Mersenne Twister State Recovery
+**Consequence:** Observing outputs from one `GetRandomString()` call provides zero information about outputs from any other call. The classic Mersenne Twister state recovery attack is inapplicable.
 
-Python's `random.Random()` uses the Mersenne Twister PRNG, which has a 624 × 32-bit internal state. With 624 consecutive 32-bit outputs, the full internal state can be reconstructed using the `untwist` technique.
+**Additionally:** Session IDs use `secrets.token_urlsafe(32)` (`class/flask_session/sessions.py:62-63`), not `GetRandomString()` at all. Session IDs have 256 bits of cryptographic entropy.
 
-Each call to `random.randint(0, 61)` consumes at least one 32-bit word from the PRNG. By observing enough consecutive `GetRandomString()` outputs (e.g., session IDs visible in logs, tokens in responses), an attacker can:
+### Remaining Issue (Code Quality)
 
-1. Map observed characters back to PRNG outputs
-2. Reconstruct the Mersenne Twister internal state
-3. Predict all future outputs of the PRNG
+Using `random.Random()` instead of `secrets` is not best practice, but with per-call instantiation from `os.urandom()`, it is not practically exploitable.
 
-### Step 3: Predict Future Security Tokens
-
-Once the PRNG state is recovered:
-- **Predict next session IDs** → hijack sessions before they're created
-- **Predict password salts** → precompute password hashes for brute-force
-- **Predict login tokens** → forge authentication tokens
-- **Predict WebSocket IDs** → hijack WebSocket connections
-
-### Fix
+### Fix (Still Recommended)
 
 ```python
 import secrets
@@ -1446,16 +1437,13 @@ PHASE 3: SECRET KEY RECOVERY (offline, < 1 second)
   6. 2.6M candidates × 2 MD5 ops = ~5.2M hashes
   7. At 10M MD5/sec → complete in 0.5 seconds
 
-PHASE 4: SESSION HIJACK VIA PRNG PREDICTION
-  With recovered secret_key + PRNG state recovery:
+PHASE 4: SESSION HIJACK — BLOCKED
+  Session IDs use secrets.token_urlsafe(32) — 256 bits of cryptographic entropy.
+  GetRandomString() creates new Random() per call — no shared PRNG state.
+  PRNG prediction is NOT feasible (Chain 11 INVALIDATED).
 
-  8. Each GET /login returns last_login_token = GetRandomString(32)
-  9. Collect ~700 login page loads to observe PRNG outputs
-  10. Recover Mersenne Twister internal state (Chain 11)
-  11. Predict future session IDs (also generated by GetRandomString)
-  12. Wait for admin to log in → predict their session_id
-  13. Sign the predicted session_id with recovered secret_key
-  14. Send request with forged cookie → piggyback on admin session
+  The attacker has the secret_key but CANNOT predict or forge session data.
+  A file-write primitive is required to plant a session file on disk.
 
   ALTERNATIVE — Direct session file write (requires webhook plugin):
   8b. Only works if admin has installed 宝塔WebHook plugin (not default)
@@ -1474,19 +1462,21 @@ COMPLEXITY: Medium — ~700 requests for PRNG recovery, or /hook for file write
 TOTAL: ~700 HTTP GETs + offline computation → root shell
 ```
 
-**Why this works with zero credentials:**
-- `/login` GET requires no auth and leaks PRNG outputs (`last_login_token`)
-- Cookie name in HTTP response → secret_key oracle (Chain 2)
-- `os.uname()` has limited entropy (discoverable via banners)
-- `psutil.boot_time()` is a single float (brutable in <1 second)
-- PRNG state recovery predicts future session IDs (Chain 11)
-- `/hook` provides unauthenticated file write if webhook plugin installed (Chain 7)
-- Multiple paths to RCE from admin session
+**Why the PRNG path is blocked:**
+- Session IDs use `secrets.token_urlsafe(32)` — NOT `GetRandomString()`
+- `GetRandomString()` creates `Random()` per call — no shared state to recover
+- **PRNG prediction does NOT work (Chain 11 invalidated)**
+
+**What still works:**
+- Cookie name in HTTP response → secret_key oracle (Chain 2) — CONFIRMED
+- `/hook` provides unauthenticated code execution if webhook plugin installed (Chain 7)
+- Multiple paths to RCE from authenticated session
 
 **Honest assessment:** The secret key recovery is trivially fast and reliable.
-The main challenge is converting secret_key knowledge into an authenticated
-session — this requires either PRNG state recovery (~700 requests, detectable)
-or a filesystem write primitive (depends on webhook plugin being installed).
+However, converting secret_key knowledge into an authenticated session requires
+a filesystem write primitive (depends on webhook plugin being installed).
+The PRNG prediction path previously described is **not feasible** due to
+per-call `Random()` instantiation with fresh entropy.
 
 ### Mega-A: Full Unauthenticated Remote RCE (Zero Credentials)
 
@@ -1626,7 +1616,7 @@ PHASE 4: INJECT
 | P1 | Replace `eval()` with `getattr()` in plugin loading | 3, 6 |
 | P1 | Switch AES from ECB to GCM mode | 6 |
 | P1 | Use `subprocess.run()` with arg lists instead of `ExecShell()` | 4, 7 |
-| P1 | Replace `random.Random()` with `secrets` module in `GetRandomString()` | 11, 13 |
+| P1 | Replace `random.Random()` with `secrets` module in `GetRandomString()` | 11 (code quality), 13 |
 | P1 | Use `hmac.compare_digest()` for token comparison | 12 |
 | P1 | Replace MD5 password hashing with bcrypt/argon2 | 13 |
 

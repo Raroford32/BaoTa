@@ -556,8 +556,10 @@ cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
 ## CHAIN 7: `/hook` Zero Authentication + Cron Body Injection = Persistent Unauthenticated RCE
 
 **Severity:** CRITICAL | **CWE:** CWE-306, CWE-78 | **CVSS:** 9.8
-**Prerequisites:** Webhook plugin installed
+**Prerequisites:** Webhook plugin installed (NOT default — admin must install it manually)
 **Impact:** Unauthenticated persistent shell command execution
+
+**Note:** The webhook plugin has `display: 0` in `data/list.json` and is NOT installed by default. The plugin code is not included in the source repo. This chain is only exploitable on panels where the admin has manually installed the `宝塔WebHook` plugin. However, it is a popular plugin for CI/CD integrations, so many production panels have it.
 
 ### Step 1: `/hook` Has Zero Authentication
 
@@ -1195,12 +1197,13 @@ PHASE 4: SESSION HIJACK VIA PRNG PREDICTION
   13. Sign the predicted session_id with recovered secret_key
   14. Send request with forged cookie → piggyback on admin session
 
-  ALTERNATIVE — Direct session file write (if /hook webhook is installed):
-  8b. Choose arbitrary session_id, sign with secret_key
-  9b. Use unauthenticated /hook route (Chain 7) to write pickle file:
-      data/session/md5("BT_:" + session_id)
-  10b. Pickle payload: {"login": True, "uid": 1, "username": "admin"}
-  11b. Request with signed cookie loads pickle → fully authenticated
+  ALTERNATIVE — Direct session file write (requires webhook plugin):
+  8b. Only works if admin has installed 宝塔WebHook plugin (not default)
+  9b. Choose arbitrary session_id, sign with secret_key
+  10b. Use unauthenticated /hook route (Chain 7) to write pickle file:
+       data/session/md5("BT_:" + session_id)
+  11b. Pickle payload: {"login": True, "uid": 1, "username": "admin"}
+  12b. Request with signed cookie loads pickle → fully authenticated
 
 PHASE 5: AUTHENTICATED ACCESS → RCE
   15. Use authenticated session to access /sock_shell WebSocket

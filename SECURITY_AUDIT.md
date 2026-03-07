@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-This audit goes beyond individual vulnerability identification to map **composite attack chains** — sequences of weaknesses that, when chained together, escalate from minor issues to full system compromise. We identified **10 distinct attack chains** and **4 mega-chain scenarios** that compose 3+ chains into complete exploitation paths.
+This audit goes beyond individual vulnerability identification to map **composite attack chains** — sequences of weaknesses that, when chained together, escalate from minor issues to full system compromise. We identified **13 distinct attack chains** and **4 mega-chain scenarios** that compose 3+ chains into complete exploitation paths.
 
 The most critical discovery is that the pickle deserialization safety mechanism (`restricted_loads`) has been **intentionally disabled** (commented out, returns `True`), while session files are stored on disk and loaded via `pickle.loads()`. Combined with a zip slip path traversal in the file extraction code, this creates a **plant-and-wait RCE** — an attacker extracts a crafted zip file, and the next admin login triggers arbitrary code execution as root.
 
@@ -67,6 +67,24 @@ The most critical discovery is that the pickle deserialization safety mechanism 
    | tmp_login   |
    | (Chain 8)   |
    +-------------+
+
+   +----------------+         +-----------------+
+   | Mersenne       |-------->| Session ID      |----> Session Hijacking
+   | Twister State  |         | Prediction      |
+   | Recovery       |         | (Chain 11)      |
+   | (Chain 11)     |         +-----------------+
+   +----------------+                |
+          |                          v
+          |                  +-------+--------+
+          |                  | Salt Prediction |----> Offline Password Crack
+          |                  | (Chain 13)      |
+          |                  +----------------+
+          |
+   +------+------+         +------------------+
+   | Timing       |-------->| API Token        |----> g.api_request=True
+   | Side-Channel |         | Byte-by-Byte     |      → CSRF Bypass → RCE
+   | (Chain 12)   |         | Recovery         |
+   +--------------+         +------------------+
 ```
 
 ---
@@ -757,6 +775,151 @@ self._last_cache = json.loads(f_data)
 
 ---
 
+## CHAIN 11: Mersenne Twister State Recovery → Session ID Prediction → Session Hijacking
+
+**Severity:** HIGH | **CWE:** CWE-338 | **CVSS:** 8.1
+**Prerequisites:** Ability to observe ~624 outputs of the PRNG (via token/session generation)
+**Impact:** Predict all future session IDs, tokens, and password salts
+
+### Step 1: Weak PRNG in All Security-Critical Randomness
+
+```python
+# class/public.py:237-251
+def GetRandomString(length):
+    from random import Random          # NOT cryptographically secure
+    strings = ''
+    chars = 'AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789'
+    chrlen = len(chars) - 1
+    random = Random()                  # Mersenne Twister PRNG
+    for i in range(length):
+        strings += chars[random.randint(0, chrlen)]
+    return strings
+```
+
+This function is used for:
+- **Session IDs** (64 chars) — session generation
+- **Login tokens** (32 chars) — `public.py:3711`
+- **Password salts** (12 chars) — `public.py:3702`
+- **WebSocket IDs** (16 chars) — WebSocket management
+- **Temporary paths** — file operations
+
+### Step 2: Mersenne Twister State Recovery
+
+Python's `random.Random()` uses the Mersenne Twister PRNG, which has a 624 × 32-bit internal state. With 624 consecutive 32-bit outputs, the full internal state can be reconstructed using the `untwist` technique.
+
+Each call to `random.randint(0, 61)` consumes at least one 32-bit word from the PRNG. By observing enough consecutive `GetRandomString()` outputs (e.g., session IDs visible in logs, tokens in responses), an attacker can:
+
+1. Map observed characters back to PRNG outputs
+2. Reconstruct the Mersenne Twister internal state
+3. Predict all future outputs of the PRNG
+
+### Step 3: Predict Future Security Tokens
+
+Once the PRNG state is recovered:
+- **Predict next session IDs** → hijack sessions before they're created
+- **Predict password salts** → precompute password hashes for brute-force
+- **Predict login tokens** → forge authentication tokens
+- **Predict WebSocket IDs** → hijack WebSocket connections
+
+### Fix
+
+```python
+import secrets
+
+def GetRandomString(length):
+    chars = 'AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789'
+    return ''.join(secrets.choice(chars) for _ in range(length))
+```
+
+---
+
+## CHAIN 12: Timing Side-Channel on Token Comparison → Byte-by-Byte Token Recovery
+
+**Severity:** HIGH | **CWE:** CWE-208 | **CVSS:** 7.5
+**Prerequisites:** Network access to API endpoint, ability to measure response timing
+**Impact:** Recover API token without brute-forcing the full hash
+
+### The Vulnerable Comparison
+
+```python
+# class/common.py:333
+if get.request_token == request_token:   # Python == is NOT timing-safe
+```
+
+Python's string `==` operator performs byte-by-byte comparison with early termination. When the first byte matches, comparison continues to the second byte (taking slightly longer). When all bytes match, the comparison takes maximum time.
+
+### Attack Method
+
+For a 32-character MD5 hex string:
+1. Fix `request_time` to a known value
+2. For position 0: try all 16 hex values (`0-9, a-f`), measure response time
+3. The value with the longest response time = correct byte (comparison proceeded further)
+4. For position 1: repeat with the correct first byte locked in
+5. Continue for all 32 positions
+
+**Total requests:** 32 positions × 16 candidates = **512 requests** (vs. 16^32 brute force)
+
+**Practical considerations:**
+- Network jitter requires statistical averaging (send each candidate ~100 times)
+- Total: ~51,200 requests — still trivially feasible
+- The 20-attempt rate limit per IP (`public.get_error_num(num_key, 20)` at line 292) can be bypassed by distributing across IPs or waiting for the 1-hour lockout to expire
+
+### Fix
+
+```python
+import hmac
+if not hmac.compare_digest(get.request_token, request_token):
+    return public.returnJson(False, 'Token mismatch')
+```
+
+---
+
+## CHAIN 13: Weak Password Hashing + PRNG Salt → Offline Password Cracking
+
+**Severity:** HIGH | **CWE:** CWE-916, CWE-328 | **CVSS:** 7.5
+**Prerequisites:** Database read access (via SQL injection or file read)
+**Impact:** Recover admin plaintext passwords
+
+### The Weak Hash Chain
+
+```python
+# class/public.py:3702-3706
+salt = GetRandomString(12)                                    # Weak PRNG salt
+pdata['password'] = md5(md5(u_info['password'] + '_bt.cn') + salt)  # Double MD5
+
+# class/public.py:3719-3734
+def password_salt(password, username=None, uid=None):
+    salt = M('users').where('id=?', (uid,)).getField('salt')
+    return md5(md5(password + '_bt.cn') + salt)               # Same weak scheme
+```
+
+**Weaknesses stacked:**
+1. **MD5 is broken** — GPU hashrate: ~8 billion MD5/sec on modern hardware
+2. **Double MD5 adds negligible cost** — still one lookup per candidate
+3. **Static suffix `_bt.cn`** — reduces entropy before salting
+4. **12-char salt from weak PRNG** — predictable if Mersenne Twister state is known (Chain 11)
+5. **Salt stored alongside hash** — standard for salted hashing, but with MD5 speed it's trivially cracked
+
+### Attack: With database access
+1. Extract `password` hash and `salt` from `users` table
+2. For each candidate password `p`: compute `md5(md5(p + '_bt.cn') + salt)`
+3. At 8B MD5/sec: entire rockyou.txt (~14M passwords) checked in < 0.002 seconds
+4. Dictionary + rules attack: ~1B candidates checked in < 1 second
+
+### Fix
+
+```python
+import bcrypt
+
+def password_hash(password):
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+def password_verify(password, hashed):
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+```
+
+---
+
 ## MEGA-CHAIN SCENARIOS
 
 ### Mega-A: Full Unauthenticated Remote RCE (Zero Credentials)
@@ -893,6 +1056,9 @@ PHASE 4: INJECT
 | P1 | Replace `eval()` with `getattr()` in plugin loading | 3, 6 |
 | P1 | Switch AES from ECB to GCM mode | 6 |
 | P1 | Use `subprocess.run()` with arg lists instead of `ExecShell()` | 4, 7 |
+| P1 | Replace `random.Random()` with `secrets` module in `GetRandomString()` | 11, 13 |
+| P1 | Use `hmac.compare_digest()` for token comparison | 12 |
+| P1 | Replace MD5 password hashing with bcrypt/argon2 | 13 |
 
 ### Long-Term — Architecture Hardening
 
@@ -932,3 +1098,7 @@ PHASE 4: INJECT
 | `BTPanel/__init__.py` | 3236 | 5 | shell=True in sock_shell |
 | `BTPanel/__init__.py` | 3289-3290 | 5, 9 | g.api_request + debug CSRF bypass |
 | `BTPanel/__init__.py` | ~2790 | 6 | get_input() param merge/pollution |
+| `class/public.py` | 237-251 | 11 | Mersenne Twister PRNG in GetRandomString() |
+| `class/public.py` | 3702-3706 | 13 | Weak PRNG salt + double MD5 password hashing |
+| `class/public.py` | 3719-3734 | 13 | password_salt() uses md5(md5()+salt) |
+| `class/common.py` | 333 | 12 | Timing-unsafe `==` comparison on tokens |

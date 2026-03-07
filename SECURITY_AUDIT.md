@@ -50,39 +50,69 @@ app.config['SESSION_COOKIE_NAME'] = public.md5(app.secret_key)
 
 **With kernel version known, only `boot_time` remains: ~2.6M candidates (1-month window) = 0.26 seconds to brute-force.**
 
-**Impact:** Forge any Flask session cookie. Set `session['login'] = True`, `session['username'] = 'admin'`. Instant authenticated access. Combined with ARCH-4, this means **instant root shell**.
+**Important nuance:** BaoTa uses **server-side filesystem sessions** (`SESSION_TYPE = 'filesystem'`, `SESSION_USE_SIGNER = True`). The cookie contains only a signed session ID, not session data. Knowing `secret_key` lets you:
+- Sign arbitrary session IDs → the server trusts the ID as authentic
+- Predict existing session IDs via ARCH-3 (PRNG recovery) → hijack admin sessions
+- Write malicious session files via zip slip (Chain 1) or webhook (Chain 7), then reference them with a signed cookie
+
+**You cannot directly inject `session['login'] = True` into the cookie itself** — the data lives on disk. But combined with ARCH-3 (predict admin's session ID) or a file-write primitive (plant session file), the secret key recovery gives complete session control.
+
+**Impact:** Sign any session ID + predict/plant session data → authenticated access → root shell (ARCH-4).
 
 ---
 
-### ARCH-2: IP Security is Theater — All Controls Bypassed by One Header
+### ARCH-2: IP-Based Security Fails Under Reverse Proxy + 2FA Bypass via Stored IP
 
-**Root Cause:** `class/public.py:1474-1485`
+**Root Cause:** `class/public.py:801-819`
 ```python
 def GetClientIp():
-    ip_from = request.headers.get('X-Forwarded-For', '')
-    if ip_from:
-        return ip_from.split(',')[0].strip()
-    ip_from = request.headers.get('X-Real-Ip', '')
-    if ip_from:
-        return ip_from.split(',')[0].strip()
-    return request.remote_addr
+    ipaddr = request.remote_addr
+    if ipaddr:
+        ipaddr = ipaddr.replace('::ffff:', '')
+    if ipaddr in ('127.0.0.1', '::1', "localhost"):  # Only trusts local proxy
+        forwarded_ips = request.headers.get('X-Forwarded-For', "").split(',')
+        if len(forwarded_ips) > 0:
+            ipaddr = forwarded_ips[-1]               # Takes LAST entry
+        elif "X-Real-Ip" in request.headers:
+            ipaddr = request.headers.get('X-Real-Ip')
+    if not check_ip(ipaddr): return '未知IP地址'
+    return ipaddr
 ```
 
-**`GetClientIp()` blindly trusts `X-Forwarded-For` without validating against trusted proxies.** Every IP-based security control in the panel is defeated by a single HTTP header.
+**Nuanced analysis — NOT blindly spoofable in all cases:**
 
-**Controls that become useless:**
+| Deployment Mode | `remote_addr` | Header Trusted? | Spoofable? |
+|----------------|---------------|-----------------|------------|
+| **Default** (direct 0.0.0.0:8888) | Real client IP | NO — localhost check fails | **NO** |
+| **Port-free access** (BaoTa's own nginx proxy) | 127.0.0.1 | YES — but nginx sets `$proxy_add_x_forwarded_for`, code takes `[-1]` (nginx-added entry) | **Mostly safe** |
+| **Custom/CDN proxy** (third-party reverse proxy from localhost) | 127.0.0.1 | YES — no validation of proxy chain | **YES — fully spoofable** |
+| **Same machine access** (localhost SSH tunnel, local process) | 127.0.0.1 | YES | **YES** |
 
-| Control | Location | Bypass |
+**Bug:** When accessed from localhost with no X-Forwarded-For header, `"".split(',')` returns `['']`, `len > 0` is true, and `ipaddr` becomes empty string `''`. This passes through to `check_ip('')`.
+
+**Real vulnerability — 2FA bypass via stored IP:** (`class/userlogin.py:546-556`)
+```python
+def check_two_step_auth(self):
+    dont_vcode_ip_info = json.loads(public.readFile("data/dont_vcode_ip.txt"))
+    if dont_vcode_ip_info["client_ip"] == public.GetClientIp():  # Stored IP comparison
+        if (now - int(dont_vcode_ip_info["add_time"])) < 86400:  # 24-hour window
+            acc_client_ip = True  # SKIP 2FA
+```
+
+After a successful login with 2FA, the IP is stored for 24-hour 2FA exemption. In proxy deployments where the IP is spoofable, an attacker can set X-Forwarded-For to match the stored IP and bypass 2FA entirely.
+
+**Controls affected ONLY in proxy deployments:**
+
+| Control | Location | Impact |
 |---------|----------|--------|
-| IP whitelist (admin panel access) | `BTPanel/__init__.py:276` `check_ip_panel()` | `X-Forwarded-For: <whitelisted-ip>` |
-| Login brute-force rate limiting | `class/userlogin.py` — per-IP attempt files | Rotate header per request = infinite attempts |
-| IP ban after failed logins | `class/userlogin.py:38-60` `check_login_limit()` | Each "new IP" gets fresh counter |
-| QR code login cache keying | `BTPanel/__init__.py` — `Md5(mac + ip)` | Spoof IP to hijack another user's QR state |
-| Audit logging | `class/userlogin.py` `write_login_log()` | Logs show spoofed IP — forensic blindness |
+| IP whitelist | `check_ip_panel()` | Bypassed if attacker routes through localhost |
+| Login rate limiting | `class/userlogin.py` per-IP tracking | Each spoofed IP gets fresh attempts |
+| 2FA bypass | `class/userlogin.py:546-556` | Skip MFA for 24 hours with stored IP |
+| Audit logging | `write_login_log()` | Logs show spoofed IP |
 
-**This is not a misconfiguration.** The code has no concept of trusted proxy validation. Even if an admin restricts panel access to `127.0.0.1`, an attacker simply sends `X-Forwarded-For: 127.0.0.1` from anywhere on the internet.
+**Honest assessment:** The default deployment (direct port 8888 access) is NOT vulnerable to IP header spoofing. The vulnerability applies to port-free/proxy deployments and same-machine access. This is a real but conditional issue, not a universal architectural failure.
 
-**Consequence:** IP whitelisting, rate limiting, and IP bans — the three primary defenses against brute force — are all simultaneously defeated. Combined with ARCH-3, an attacker has unlimited attempts to guess credentials with zero detection.
+**Consequence in affected deployments:** IP whitelisting, rate limiting, and 2FA — the primary defenses against brute force — are all simultaneously defeated. Combined with ARCH-3, an attacker has unlimited attempts to guess credentials with zero detection.
 
 ---
 
@@ -163,39 +193,49 @@ Anonymous user ──── session['login'] = True ────► Root shell
 
 ---
 
-### The Complete Systemic Attack (Always Works, ~30 Requests)
+### The Complete Systemic Attack (ARCH-1 + ARCH-4, Always Works, ~5 Requests)
 
-These four architectural failures compose into an **unconditional, always-exploitable, complete compromise**:
+ARCH-1 and ARCH-4 alone compose into a **complete, unconditional compromise** — no IP spoofing needed:
 
 ```
-Step 1 (ARCH-2): Set X-Forwarded-For header to bypass IP whitelist
-                 → Panel accessible from any IP
+Step 1 (ARCH-1): Send ANY request to panel port 8888
+                 → Observe Set-Cookie header: cookie name = md5(secret_key)
 
-Step 2 (ARCH-1): Observe cookie name from HTTP response
-                 + Trigger 500 error to leak kernel version
-                 → Brute-force secret_key (~0.3s)
+Step 2 (ARCH-1): Trigger 500 error (e.g., malformed request)
+                 → If debug.pl exists: traceback leaks OS version
+                 → Otherwise: fingerprint kernel via SSH/HTTP headers
 
-Step 3 (ARCH-1 + ARCH-4): Forge session cookie with login=True
-                           → Authenticated as admin
+Step 3 (ARCH-1): Offline brute-force boot_time (~0.3s)
+                 → Recover exact secret_key
 
-Step 4 (ARCH-4): Connect to /webssh/ws WebSocket
-                 → Root shell, zero logging
+Step 4 (ARCH-1 + ARCH-4): Forge Flask session cookie:
+                           session['login'] = True
+                           → Fully authenticated
 
-Total: ~30 HTTP requests. No brute-forcing credentials.
-No plugins required. No race conditions.
-No configuration dependency. ALWAYS works.
+Step 5 (ARCH-4): Connect to /webssh/ws WebSocket
+                 → Root shell, no command filtering, no audit trail
+
+Total: ~5 HTTP requests + offline computation.
+No credentials. No plugins. No race conditions.
+No IP spoofing needed. Works against default deployment.
 ```
 
-**Alternative path using ARCH-3 instead of ARCH-1:**
+**Prerequisite:** Attacker must be able to determine `os.uname()` output (kernel version, hostname). Kernel version is often discoverable via SSH banners, error pages, or common distro patterns. Hostname may require more effort but has limited entropy.
+
+**Alternative path using ARCH-3 (no uname knowledge needed):**
 ```
-Step 1 (ARCH-2): Bypass IP whitelist via header
-Step 2 (ARCH-3): 25 GET /login requests → recover PRNG state
-Step 3 (ARCH-3): Predict CSRF tokens + CAPTCHA codes
-Step 4 (ARCH-2): Unlimited brute-force with no rate limiting
-Step 5 (ARCH-4): Login → root shell
+Step 1 (ARCH-3): 25 GET /login requests → recover PRNG state
+Step 2 (ARCH-3): Predict CSRF tokens + CAPTCHA codes
+Step 3: Brute-force login (5 attempts per 300s per IP, or
+        faster via ARCH-2 in proxy deployments)
+Step 4 (ARCH-4): Login → root shell
 ```
 
-Both paths require **zero prior knowledge** beyond the target IP and port.
+**In proxy deployments, add ARCH-2 for unlimited brute-force:**
+```
+Step 2.5 (ARCH-2): Rotate X-Forwarded-For per request
+                   → Unlimited login attempts, no rate limiting
+```
 
 ---
 

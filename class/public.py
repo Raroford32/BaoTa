@@ -735,7 +735,9 @@ def is_ipv4(ip):
         @return True/False
     '''
     # 验证基本格式
-    if not re.match(r"^\d{1,3}.\d{1,3}.\d{1,3}.\d{1,3}$", ip):
+    # Security fix: Escape dots in regex — unescaped '.' matches ANY character,
+    # allowing injection payloads like "1;id;2;3;4" to pass validation.
+    if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
         return False
 
     # 验证每个段是否在合理范围

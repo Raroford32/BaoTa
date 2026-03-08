@@ -114,27 +114,32 @@ class firewalls:
         if not self.CheckFirewallStatus(): return public.returnMsg(False,'当前系统防火墙未开启')
         import time
         import re
+        import shlex
         ip_format = get.port.split('/')[0]
         if not public.check_ip(ip_format): return public.returnMsg(False,'FIREWALL_IP_FORMAT')
         # if public.is_ipv6(ip_format): return public.returnMsg(False,'暂不支持屏蔽IPv6')
         if ip_format in  ['0.0.0.0','127.0.0.0',"::1"]: return public.returnMsg(False,'请不要花样作死!')
         address = get.port
+        # Security fix: Strict validation — address must be a valid IP/CIDR only.
+        # The original code concatenated user input directly into shell commands.
+        if not re.match(r'^[\d\.:a-fA-F/]+$', address):
+            return public.returnMsg(False,'FIREWALL_IP_FORMAT')
+        safe_addr = shlex.quote(address)
         if public.M('firewall').where("port=?",(address,)).count() > 0: return public.returnMsg(False,'FIREWALL_IP_EXISTS')
         if self.__isUfw:
             if public.is_ipv6(ip_format):
-                public.ExecShell('ufw deny from ' + address + ' to any')
+                public.ExecShell('ufw deny from ' + safe_addr + ' to any')
             else:
-                public.ExecShell('ufw insert 1 deny from ' + address + ' to any')
+                public.ExecShell('ufw insert 1 deny from ' + safe_addr + ' to any')
         else:
             if self.__isFirewalld:
-                #self.__Obj.AddDropAddress(address)
                 if public.is_ipv6(ip_format):
                     public.ExecShell('firewall-cmd --permanent --add-rich-rule=\'rule family=ipv6 source address="'+ address +'" drop\'')
                 else:
                     public.ExecShell('firewall-cmd --permanent --add-rich-rule=\'rule family=ipv4 source address="'+ address +'" drop\'')
             else:
                 if public.is_ipv6(ip_format): return public.returnMsg(False,'FIREWALL_IP_FORMAT')
-                public.ExecShell('iptables -I INPUT -s '+address+' -j DROP')
+                public.ExecShell('iptables -I INPUT -s '+safe_addr+' -j DROP')
 
         public.WriteLog("TYPE_FIREWALL", 'FIREWALL_DROP_IP',(address,))
         addtime = time.strftime('%Y-%m-%d %X',time.localtime())

@@ -1463,6 +1463,18 @@ class crontab:
         except Exception as e:
             print(e)
     
+    # Security fix: Validate shell-interpolated parameters to prevent command injection.
+    # All parameters that end up in ExecShell or shell scripts MUST be alphanumeric.
+    def _safe_shell_param(self, value, param_name, allow_chars=''):
+        """Validate a parameter before interpolation into shell commands."""
+        if not value:
+            return value
+        value = str(value)
+        safe_pattern = r'^[\w\.\-\,\/\:' + re.escape(allow_chars) + r']+$'
+        if not re.match(safe_pattern, value):
+            raise ValueError('参数[{}]包含不安全字符'.format(param_name))
+        return value
+
     # 取执行脚本
     def GetShell(self, param):
         type = param['sType']
@@ -1470,6 +1482,9 @@ class crontab:
             cronName = public.md5(public.md5(str(time.time()) + '_bt'))
         else:
             cronName = param['echo']
+
+        # Security fix: Validate cronName — it's interpolated into ExecShell commands
+        cronName = self._safe_shell_param(cronName, 'echo')
 
         cronPath = public.GetConfigValue('setup_path') + '/cron'
         cronjobPath = '{cronPath}/{cronName}'.format(cronPath=cronPath,cronName=cronName)
@@ -1480,23 +1495,31 @@ class crontab:
         else:
             head = "#!/bin/bash\nPATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin\nexport PATH\n"
             head += "echo $$ > " + cronFile + "\n"  # 将PID保存到文件中
-            
+
             second = param.get('second', "")
             time_type=param['type']
             if second:
+                # Security fix: Validate second and time_type before shell interpolation
+                second = self._safe_shell_param(second, 'second')
                 time_type="second-n"
                 head += 'if [[ $1 != "start" ]]; then\n'
                 head += ' btpython /www/server/panel/script/second_task.py {} {} \n'.format(second,cronName)
                 head += ' exit 0\n'
                 head += 'fi\n'
             public.ExecShell("chmod +x /www/server/panel/script/modify_second_cron.sh")
-            public.ExecShell("nohup /www/server/panel/script/modify_second_cron.sh {} {} {} &".format(time_type,second,cronName) )
+            # Security fix: Validate all parameters before shell interpolation
+            safe_time_type = self._safe_shell_param(time_type, 'type')
+            safe_second = self._safe_shell_param(second, 'second') if second else ''
+            public.ExecShell("nohup /www/server/panel/script/modify_second_cron.sh {} {} {} &".format(safe_time_type,safe_second,cronName) )
             
             time_type = param.get('time_type', '')
             if time_type:
                 time_list=param.get('time_set', '')
                 special_time=param.get('special_time', '')
-                # if time_type == "sweek":
+                # Security fix: Validate time parameters before shell interpolation
+                time_type = self._safe_shell_param(time_type, 'time_type')
+                special_time = self._safe_shell_param(special_time, 'special_time')
+                time_list = self._safe_shell_param(time_list, 'time_set')
                 # 调用 Python 脚本进行时间检查
                 head += 'if [[ $1 != "start" ]]; then\n'
                 head += ' if ! btpython /www/server/panel/script/time_check.py time_type={} special_time={} time_list={}; then\n'.format(time_type, ",".join(special_time.split(",")), ",".join(time_list.split(",")))
@@ -1531,6 +1554,13 @@ class crontab:
                 special_time = param['special_time']
 
             setup_path = public.GetConfigValue('setup_path')
+            # Security fix: Validate sName, urladdress, log_cut_path, special_time
+            # before interpolation into shell scripts executed as root.
+            param['sName'] = self._safe_shell_param(param.get('sName', ''), 'sName')
+            if 'urladdress' in param:
+                param['urladdress'] = self._safe_shell_param(param.get('urladdress', ''), 'urladdress', allow_chars='@')
+            log_cut_path = self._safe_shell_param(log_cut_path, 'log_cut_path')
+            special_time = self._safe_shell_param(special_time, 'special_time')
             wheres = {
                 'path':                     head + "{python_bin} {setup_path}/panel/script/backup.py path {sName} {save}{attach_param}".format(python_bin=python_bin,setup_path=setup_path, sName=param['sName'], save=str(param['save']), attach_param=attach_param),
                 'site':                     head + "{python_bin} {setup_path}/panel/script/backup.py site {sName} {save}{attach_param}".format(python_bin=python_bin, setup_path=setup_path, sName=param['sName'], save=str(param['save']), attach_param=attach_param),

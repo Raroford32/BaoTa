@@ -190,13 +190,24 @@ Key line ranges in `class/public.py`:
 - AUTH-4: 2-min client hash grace period
 - AUTH-5: Cookie name leaks key hash
 
-### Under Investigation (Unauth Paths)
-- UNAUTH-1: Login endpoint parameter manipulation
-- UNAUTH-2: Flask-Session filesystem injection
-- UNAUTH-3: Unauthenticated hook/callback endpoints
-- UNAUTH-4: Static file path traversal
-- UNAUTH-5: API key brute force / timing attack
-- UNAUTH-6: Session fixation via predictable cookie
+### Confirmed Unconditional Zero-Days (NO auth, NO brute force, NO conditions)
+- **ZERO-DAY-1**: MITM panel update → unsigned ZIP extracted as root (ajax.py:997, http_requests.py verify=False)
+- **ZERO-DAY-2**: curl -k|bash auto-recovery (task.py:1901, jobs.py:1094) — TLS verification disabled
+- **ZERO-DAY-3**: MITM plugin install → install.sh runs as root unsignedt (panelPlugin.py:704,3882)
+- **ZERO-DAY-4**: Debug error handler leaks system info to unauth users → enables session forgery
+- **ZERO-DAY-5**: Predictable secret key md5(uname+boot_time) + cookie name oracle → session forgery → RCE
+
+### Confirmed Local Privilege Escalation (no panel auth needed)
+- LOCAL-1: Pickle deserialization in session files (restricted_loads disabled, session_simpile.py:29)
+- LOCAL-2: SQLite task queue → shell exec as root (task.py:2227)
+- LOCAL-3: Task JSON files in data/tasks/ → plugin/module function execution (task.py:1824)
+- LOCAL-4: Pickle in system_cache.pkl (task.py:2444)
+- LOCAL-5: World-writable /dev/shm IPC → trigger task execution
+
+### Confirmed Supply Chain Failures
+- UPDATE-1: upgrade_panel.py downloads over plain HTTP (line 498)
+- UPDATE-2: Download node URL from writable JSON file (public.py:856)
+- UPDATE-3: No code signing anywhere — not updates, not plugins, not scripts
 
 ---
 

@@ -2156,6 +2156,11 @@ def panel_public():
             p = panelPing.Test()
             get = p.check(get)
             if not get: return abort(404)
+            # Security fix: Whitelist allowed methods instead of using arbitrary getattr().
+            # The original code allowed calling ANY method on panelPing.Test() via user-supplied 'act'.
+            _allowed_ping_acts = ['ping', 'tracert', 'check']
+            if get.get('act', '') not in _allowed_ping_acts:
+                return abort(404)
             result = getattr(p, get['act'])(get)
             result_type = type(result)
             if str(result_type).find('Response') != -1: return result
@@ -2233,9 +2238,12 @@ def panel_other(name=None, fun=None, stype=None):
     if not name: return abort(404)
     if not re.match(r"^[\w\-]+$", name): return abort(404)
     if fun and not re.match(r"^[\w\-\.]+$", fun): return abort(404)
+    # Security fix: Removed unauthenticated bypass for mail_sys/send_mail_http.json.
+    # The original code skipped comm.local() entirely for this path, allowing
+    # unauthenticated mail sending when the mail_sys plugin was installed.
+    comReturn = comm.local()
+    if comReturn: return comReturn
     if name != "mail_sys" or fun != "send_mail_http.json":
-        comReturn = comm.local()
-        if comReturn: return comReturn
         if not stype:
             tmp = fun.split('.')
             fun = tmp[0]

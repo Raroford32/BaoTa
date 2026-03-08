@@ -73,9 +73,16 @@ if os.path.exists(basic_auth_conf):
         pass
 
 # 初始化SESSION服务
-app.secret_key = public.md5(
-    str(os.uname()) +
-    str(psutil.boot_time()))
+# Security fix: Use a persistent random secret key instead of predictable system values.
+# The old key was md5(os.uname() + boot_time) — fully deterministic and reconstructable.
+_secret_key_file = os.path.join(panel_path, 'data', '.secret_key')
+if os.path.exists(_secret_key_file):
+    app.secret_key = public.readFile(_secret_key_file)
+else:
+    import secrets as _secrets
+    app.secret_key = _secrets.token_hex(32)
+    public.writeFile(_secret_key_file, app.secret_key)
+    os.chmod(_secret_key_file, 0o600)
 local_ip = None
 my_terms = {}
 
@@ -2367,8 +2374,23 @@ def panel_other(name=None, fun=None, stype=None):
 @app.route('/hook', methods=method_all)
 def panel_hook():
     # webhook接口
+    # Security fix: Validate a webhook-specific secret token to prevent unauthenticated access.
+    # Webhooks must include ?key=<webhook_key> matching the stored key.
     get = get_input()
     if not os.path.exists('plugin/webhook'):
+        return abort(404)
+    webhook_key_file = os.path.join(panel_path, 'config', 'webhook_key.json')
+    if os.path.exists(webhook_key_file):
+        try:
+            import hmac
+            wk_conf = json.loads(public.readFile(webhook_key_file))
+            provided_key = getattr(get, 'key', '')
+            if not provided_key or not hmac.compare_digest(str(provided_key), str(wk_conf.get('key', ''))):
+                return abort(404)
+        except:
+            return abort(404)
+    else:
+        # No webhook key configured — reject all requests for safety
         return abort(404)
     if 'p' in get or 'limit' in get:
         return abort(404)
@@ -2516,7 +2538,8 @@ class run_exec:
 
 def check_csrf():
     # CSRF校验
-    if app.config['DEBUG']: return True
+    # Security fix: Never bypass CSRF validation in debug mode.
+    # Debug mode should not weaken security — CSRF is always required.
     http_token = request.headers.get('x-http-token')
     if not http_token: return False
     if http_token != public.get_csrf_sess_html_token_value(): return False

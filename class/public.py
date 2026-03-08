@@ -5581,8 +5581,12 @@ def get_login_token_auth():
     if not login_token == None: return login_token
 
     login_token_file = '{}/data/login_token.pl'.format(get_panel_path())
-    login_token = '1234567890'
     if not os.path.exists(login_token_file):
+        # Security fix: Generate and persist a random token instead of using
+        # the hardcoded default '1234567890' which makes session forgery trivial.
+        login_token = GetRandomString(32)
+        writeFile(login_token_file, login_token)
+        cache.set(skey, login_token, 3600)
         return login_token
     login_token = readFile(login_token_file)
     cache.set(skey, login_token, 3600)
@@ -7517,8 +7521,9 @@ def get_client_hash():
             client_sync_count += 1
             session[ckey] = client_sync_count
 
-        # 非唯一IP，使用UA生成HASH
-        client_hash = md5('')
+        # Security fix: Use IP + User-Agent instead of empty string.
+        # md5('') is identical for all users, making session hijacking trivial.
+        client_hash = md5(request.remote_addr + request.headers.get('User-Agent', ''))
 
     return client_hash
 
@@ -7531,8 +7536,10 @@ def check_client_hash():
     '''
     from BTPanel import session, request
 
-    # 如果未开启SSL，不验证
-    if is_ssl(): return True
+    # Security fix: Removed unconditional SSL bypass.
+    # SSL should not disable client hash validation — it protects against session theft.
+    # The original code returned True (skip all checks) when SSL was enabled,
+    # meaning stolen sessions worked from any IP when SSL was on.
 
     skey = 'client_hash'
     client_hash = get_client_hash()

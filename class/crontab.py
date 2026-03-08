@@ -1082,10 +1082,24 @@ class crontab:
                 return public.returnMsg(False, 'CRONTAB_TASKNAME_EMPTY')
             if get['sType'] == 'toShell':
                 get['sBody'] = get['sBody'].replace('\r\n', '\n')
+                # Security fix: Validate sBody to block shell injection patterns.
+                # sBody is written directly into executable bash scripts run as root.
+                _dangerous_patterns = [
+                    '/dev/tcp/', '/dev/udp/',       # reverse shells
+                    'base64 -d', 'base64 --decode', # encoded payloads
+                    '\\x', '\\u00',                 # hex-encoded payloads
+                ]
+                _sbody_lower = get['sBody'].lower()
+                for _pat in _dangerous_patterns:
+                    if _pat in _sbody_lower:
+                        return public.returnMsg(False, '脚本内容包含不允许的危险模式: {}'.format(_pat))
                 # 如果user有值，则修改sBody
                 user = get.get('user', 'root')
                 if user and user!='root':
-                    get['sBody'] = "sudo -u {0} bash -c '{1}'".format(user, get['sBody'])
+                    # Security fix: Validate user to prevent injection via sudo -u
+                    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_\-]*$', user):
+                        return public.returnMsg(False, '用户名格式不正确')
+                    get['sBody'] = "sudo -u {0} bash -c '{1}'".format(user, get['sBody'].replace("'", "'\\''"))
                 # 如果get中有version键，就替换sBody中的版本号占位符
                 if get.get('version',''):
                     version = get['version'].replace(".", "")

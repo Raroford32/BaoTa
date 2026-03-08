@@ -96,8 +96,15 @@ class ftp:
             get.path = get['path'].strip()
             get.path = get.path.replace("\\", "/")
             fileObj.CreateDir(get)
-            public.ExecShell('chown www.www ' + get.path)
-            command = 'echo -e "{}\n{}\n" | {}/pure-pw useradd "{}" -u www -d {}'.format(password,password,self.__runPath,username,get["path"])
+            # Security fix: Use shlex.quote() to prevent command injection via
+            # username, password, and path parameters (all were unsanitized).
+            import shlex
+            safe_path = shlex.quote(get.path)
+            safe_user = shlex.quote(username)
+            safe_pass = shlex.quote(password)
+            public.ExecShell('chown www.www ' + safe_path)
+            command = 'echo -e {}\\n{}\\n | {}/pure-pw useradd {} -u www -d {}'.format(
+                safe_pass, safe_pass, self.__runPath, safe_user, safe_path)
             result = subprocess.run(command, shell=True, text=True, capture_output=True)
             if result.returncode != 0:
                 return public.returnMsg(False, '执行命令添加用户失败: {}'.format(result.stderr))

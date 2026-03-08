@@ -2441,7 +2441,15 @@ CREATE INDEX IF NOT EXISTS 'proc' ON 'process_top_list'('addtime');
             if hash_obj.hexdigest() != self._cache_hash_sum:
                 self._last_cache = {}
             else:
-                self._last_cache = pickle.loads(f_data)
+                # Security fix: Use json instead of pickle for cache deserialization.
+                # pickle.loads() with file-based data enables arbitrary code execution
+                # if an attacker can write to the cache file via any file-write vuln.
+                # task.py runs as root, so pickle RCE = instant root shell.
+                try:
+                    import json as _json
+                    self._last_cache = _json.loads(f_data)
+                except Exception:
+                    self._last_cache = {}
         else:
             self._last_cache = {}
 
@@ -2474,8 +2482,10 @@ CREATE INDEX IF NOT EXISTS 'proc' ON 'process_top_list'('addtime');
 
     def _save_cache(self):
         try:
+            import json as _json
             with open(self.cache_file, 'wb') as f:
-                f_data = pickle.dumps(self._last_cache)
+                # Security fix: Use json instead of pickle for cache serialization.
+                f_data = _json.dumps(self._last_cache, default=str).encode('utf-8')
                 hash_obj = hashlib.md5()
                 hash_obj.update(f_data)
                 self._cache_hash_sum = hash_obj.hexdigest()

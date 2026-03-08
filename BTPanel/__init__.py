@@ -3316,9 +3316,10 @@ def check_csrf_websocket(ws, args):
         @param ws<WebSocket> websocket对像
         @return void
     '''
+    # Security fix: Removed debug mode bypass. WebSocket endpoints like /sock_shell
+    # execute arbitrary commands as root — CSRF must always be enforced.
     if g.is_aes: return True
     if g.api_request: return True
-    if public.is_debug(): return True
     is_success = True
     if not 'x-http-token' in args:
         is_success = False
